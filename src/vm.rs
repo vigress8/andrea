@@ -9,22 +9,23 @@ enum OpCode {
     Load = 3,
     Load2 = 4,
     LoadConst = 5,
-    IAdd = 6,
-    ISub = 7,
-    IMul = 8,
-    IDiv = 9,
-    INeg = 10,
-    ICmpEQ = 11,
-    ICmpGT = 12,
-    ICmpGE = 13,
-    ICmpLT = 14,
-    ICmpLE = 15,
-    LoadVar = 16,
-    StoreVar = 17,
-    Call = 18,
+    LoadLocal = 6,
+    StoreLocal = 7,
+    LoadGlobal = 8,
+    Call = 9,
+    IAdd = 10,
+    ISub = 11,
+    IMul = 12,
+    IDiv = 13,
+    INeg = 14,
+    ICmpEQ = 15,
+    ICmpGT = 16,
+    ICmpGE = 17,
+    ICmpLT = 18,
+    ICmpLE = 19,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Value {
     Integer(isize),
     Bool(bool),
@@ -32,6 +33,7 @@ enum Value {
 
 #[derive(Clone, Debug, PartialEq)]
 enum VMError {
+    ArgumentError,
     ConstIndexError,
     IllegalGoto,
     StackEmpty,
@@ -46,22 +48,45 @@ fn combine_bytes(b1: u8, b2: u8) -> usize {
     (b1 as usize) << 8 | b2 as usize
 }
 
-const MAX_STACK_SIZE: usize = 256;
 #[derive(Clone, Debug)]
+struct Function<'a> {
+    argc: usize,
+    chunk: &'a [u8],
+}
+
+impl<'a> Function<'a> {
+    fn new(argc: usize, chunk: &'a [u8]) -> Self {
+        Self { argc, chunk }
+    }
+}
+
+const MAX_STACK_SIZE: usize = 256;
+#[derive(Clone, Debug, Default)]
 struct VM<'a> {
     stack: Vec<Value>,
-    variables: Vec<Value>,
     constants: Vec<Value>,
+    locals: Vec<Value>,
+    globals: Vec<Value>,
+    functions: Vec<Function<'a>>,
     chunk: &'a [u8],
     current: usize,
 }
 
 impl<'a> VM<'a> {
-    fn new(variables: Vec<Value>, constants: Vec<Value>, chunk: &'a [u8]) -> Self {
+    fn new(
+        stack: Vec<Value>,
+        constants: Vec<Value>,
+        locals: Vec<Value>,
+        globals: Vec<Value>,
+        functions: Vec<Function<'a>>,
+        chunk: &'a [u8],
+    ) -> Self {
         Self {
-            stack: Vec::new(),
-            variables,
+            stack,
             constants,
+            locals,
+            globals,
+            functions,
             chunk,
             current: 0,
         }
@@ -81,13 +106,6 @@ impl VM<'_> {
 
     fn pop(&mut self) -> VMResult<Value> {
         self.stack.pop().ok_or(VMError::StackEmpty)
-    }
-
-    fn peek(&mut self) -> VMResult<u8> {
-        self.chunk
-            .get(self.current)
-            .copied()
-            .ok_or(VMError::UnexpectedEOF)
     }
 
     fn advance(&mut self) -> VMResult<u8> {
@@ -135,6 +153,10 @@ impl VM<'_> {
             Load => self.load(),
             Load2 => self.load2(),
             LoadConst => self.load_const(),
+            LoadLocal => self.load_local(),
+            StoreLocal => self.store_local(),
+            LoadGlobal => self.load_global(),
+            Call => self.call(),
             IAdd => self.i_add(),
             ISub => self.i_sub(),
             IMul => self.i_mul(),
@@ -145,9 +167,6 @@ impl VM<'_> {
             ICmpGE => self.i_cmpge(),
             ICmpLT => self.i_cmplt(),
             ICmpLE => self.i_cmple(),
-            LoadVar => self.load_var(),
-            StoreVar => self.store_var(),
-            Call => self.call(),
         }
     }
 
@@ -198,41 +217,56 @@ impl VM<'_> {
 
     fn load_const(&mut self) -> VMResult<()> {
         let index = self.advance()? as usize;
-        let constant = self
-            .constants
-            .get(index)
-            .ok_or(VMError::ConstIndexError)?
-            .clone();
+        let &constant = self.constants.get(index).ok_or(VMError::ConstIndexError)?;
         self.push(constant)
     }
 
-    fn load_var(&mut self) -> VMResult<()> {
+    fn load_local(&mut self) -> VMResult<()> {
         let b1 = self.advance()?;
         let b2 = self.advance()?;
         let index = combine_bytes(b1, b2);
-        let variable = self
-            .variables
-            .get(index)
-            .ok_or(VMError::UnboundVariable)?
-            .clone();
+        let &variable = self.locals.get(index).ok_or(VMError::UnboundVariable)?;
         self.push(variable)
     }
 
-    fn store_var(&mut self) -> VMResult<()> {
+    fn store_local(&mut self) -> VMResult<()> {
         let b1 = self.advance()?;
         let b2 = self.advance()?;
         let index = combine_bytes(b1, b2);
         let value = self.pop()?;
-        if self.variables.get(index).is_some() {
-            self.variables[index] = value;
+        if self.locals.get(index).is_some() {
+            self.locals[index] = value;
         } else {
-            self.variables.push(value);
+            self.locals.push(value);
         }
         Ok(())
     }
 
+    fn load_global(&mut self) -> VMResult<()> {
+        let b1 = self.advance()?;
+        let b2 = self.advance()?;
+        let index = combine_bytes(b1, b2);
+        let &variable = self.globals.get(index).ok_or(VMError::UnboundVariable)?;
+        self.push(variable)
+    }
+
     fn call(&mut self) -> VMResult<()> {
-        todo!()
+        let index = self.advance()? as usize;
+        let func = self.functions.get(index).ok_or(VMError::UnboundVariable)?;
+
+        let mut fork = self.clone();
+        fork.current = 0;
+        fork.chunk = func.chunk;
+        fork.globals = fork.locals;
+
+        let mut params = vec![];
+        for _ in 0..func.argc {
+            params.push(self.pop()?);
+        }
+        fork.locals = params;
+
+        fork.execute_all()?;
+        self.push(fork.pop()?)
     }
 
     fn i_add(&mut self) -> VMResult<()> {
@@ -302,72 +336,79 @@ mod tests {
 
     #[test]
     fn test_execute_all() {
-        let constants = vec![Value::Integer(2500), Value::Integer(378)];
-        let chunk = &[
-            LoadConst as u8,
-            0,
-            LoadConst as u8,
-            1,
-            IAdd as u8,
-            Return as u8,
-        ];
-        let mut vm = VM::new(vec![], constants, chunk);
+        let mut vm = VM {
+            constants: vec![Value::Integer(2500), Value::Integer(378)],
+            chunk: &[
+                LoadConst as u8,
+                0,
+                LoadConst as u8,
+                1,
+                IAdd as u8,
+                Return as u8,
+            ],
+            ..Default::default()
+        };
         vm.execute_all().unwrap();
         assert_eq!(vm.stack, vec![Value::Integer(2878)]);
 
-        let chunk = &[Load as u8, 5, Load2 as u8, 3, 4, IMul as u8, Return as u8];
-        let mut vm = VM::new(vec![], vec![], chunk);
+        let mut vm = VM {
+            chunk: &[Load as u8, 5, Load2 as u8, 3, 4, IMul as u8, Return as u8],
+            ..Default::default()
+        };
         vm.execute_all().unwrap();
         assert_eq!(vm.stack, vec![Value::Integer(3860)]);
     }
 
     #[test]
     fn test_goto() {
-        let chunk = &[Load as u8, 1, Goto as u8, 0, 0];
-
-        let mut vm = VM::new(vec![], vec![], chunk);
+        let mut vm = VM {
+            chunk: &[Load as u8, 1, Goto as u8, 0, 0],
+            ..Default::default()
+        };
         assert_eq!(vm.execute_all(), Err(VMError::StackOverflow));
         assert_eq!(vm.stack, vec![Value::Integer(1); MAX_STACK_SIZE]);
     }
 
     #[test]
     fn test_factorial() {
-        // n = 5
-        let variables = vec![Value::Integer(5)];
-
         #[rustfmt::skip]
-        let chunk = &[
+        let factorial_chunk = &[
             // x = 1
-            Load     as u8,    1,
-            StoreVar as u8, 0, 1,
+            Load       as u8,    1,
+            StoreLocal as u8, 0, 1,
 
-            // while not n <= 1
-            Load     as u8,    1,
-            LoadVar  as u8, 0, 0,
-            ICmpLE   as u8,
-            GotoIf   as u8, 0, 36,
+            // while n > 1 {
+            LoadLocal  as u8, 0, 0,
+            Load       as u8,    1,
+            ICmpGT     as u8,
+            GotoIf     as u8, 0, 36,
 
             // x = x * n
-            LoadVar  as u8, 0, 1,
-            LoadVar  as u8, 0, 0,
-            IMul     as u8,
-            StoreVar as u8, 0, 1,
+            LoadLocal  as u8, 0, 1,
+            LoadLocal  as u8, 0, 0,
+            IMul       as u8,
+            StoreLocal as u8, 0, 1,
 
             // n = n - 1
-            Load     as u8,    1,
-            LoadVar  as u8, 0, 0,
-            ISub     as u8,
-            StoreVar as u8, 0, 0,
+            Load       as u8,    1,
+            LoadLocal  as u8, 0, 0,
+            ISub       as u8,
+            StoreLocal as u8, 0, 0,
 
-            // Jump to loop start
-            Goto     as u8, 0, 5,
+            // }
+            Goto       as u8, 0, 5,
 
             // return x
-            LoadVar  as u8, 0, 1,
-            Return   as u8,
+            LoadLocal  as u8, 0, 1,
+            Return     as u8,
         ];
 
-        let mut vm = VM::new(variables, vec![], chunk);
+        let factorial = Function::new(1, factorial_chunk);
+        let mut vm = VM {
+            chunk: &[Load as u8, 5, Call as u8, 0],
+            functions: vec![factorial],
+            ..Default::default()
+        };
         vm.execute_all().unwrap();
         assert_eq!(vm.stack, vec![Value::Integer(120)]);
     }
